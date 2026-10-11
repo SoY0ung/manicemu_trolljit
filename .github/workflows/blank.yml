@@ -34,42 +34,29 @@ jobs:
 
           echo "Version: $VERSION"
 
-          python3 <<'PY'
-          import json
-          import os
-          import urllib.request
+          ASSET="ManicEMU.${VERSION}.SideloadJIT.ipa"
 
-          version = os.environ["VERSION"]
+          URL="https://github.com/Manic-EMU/ManicEMU/releases/download/${VERSION}/${ASSET}"
 
-          api = (
-              "https://api.github.com/repos/"
-              "Manic-EMU/ManicEMU/releases/tags/"
-              + version
-          )
+          echo "Downloading:"
+          echo "$URL"
 
-          with urllib.request.urlopen(api) as r:
-              release = json.load(r)
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            --output ManicEMU.ipa \
+            "$URL"
 
-          candidates = [
-              x for x in release["assets"]
-              if x["name"].endswith(".ipa")
-              and "SideloadJIT" in x["name"]
-          ]
-
-          if not candidates:
-              raise SystemExit("SideloadJIT IPA not found")
-
-          asset = candidates[0]
-
-          print("Found:", asset["name"])
-
-          urllib.request.urlretrieve(
-              asset["browser_download_url"],
-              "ManicEMU.ipa"
-          )
-          PY
-
+          echo "===== Download complete ====="
           ls -lh ManicEMU.ipa
+
+          echo "===== Verify IPA ====="
+          unzip -t ManicEMU.ipa >/dev/null
+
+          echo "IPA verification passed."
 
       # ------------------------------------------------------------
       # 2. Download TrollStoreJITEnabler source
