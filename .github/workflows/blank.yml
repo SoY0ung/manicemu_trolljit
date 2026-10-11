@@ -1,0 +1,183 @@
+name: Build ManicEMU TrollStoreJIT
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ManicEMU release tag"
+        required: true
+        default: "v2.0.1"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install ldid
+
+      # ------------------------------------------------------------
+      # 1. Download official ManicEMU SideloadJIT IPA
+      # ------------------------------------------------------------
+      - name: Download ManicEMU
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "Version: $VERSION"
+
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          version = os.environ["VERSION"]
+
+          api = (
+              "https://api.github.com/repos/"
+              "Manic-EMU/ManicEMU/releases/tags/"
+              + version
+          )
+
+          with urllib.request.urlopen(api) as r:
+              release = json.load(r)
+
+          candidates = [
+              x for x in release["assets"]
+              if x["name"].endswith(".ipa")
+              and "SideloadJIT" in x["name"]
+          ]
+
+          if not candidates:
+              raise SystemExit("SideloadJIT IPA not found")
+
+          asset = candidates[0]
+
+          print("Found:", asset["name"])
+
+          urllib.request.urlretrieve(
+              asset["browser_download_url"],
+              "ManicEMU.ipa"
+          )
+          PY
+
+          ls -lh ManicEMU.ipa
+
+      # ------------------------------------------------------------
+      # 2. Download TrollStoreJITEnabler source
+      # ------------------------------------------------------------
+      - name: Clone TrollStoreJITEnabler
+        run: |
+          git clone \
+            https://github.com/Rednick16/TrollStoreJITEnabler.git
+
+          cd TrollStoreJITEnabler
+
+          # Pin currently known revision for reproducibility
+          git checkout f1bc5186608b3248e614d6c8838a8332663d770c
+
+      # ------------------------------------------------------------
+      # 3. Compile TrollStoreJITEnabler as iOS arm64 dylib
+      # ------------------------------------------------------------
+      - name: Build TrollStoreJITEnabler
+        run: |
+          set -euo pipefail
+
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -dynamiclib \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Security \
+            -install_name "@executable_path/TrollStoreJITEnabler.dylib" \
+            TrollStoreJITEnabler/entry.m \
+            TrollStoreJITEnabler/utils.m \
+            -o TrollStoreJITEnabler.dylib
+
+          file TrollStoreJITEnabler.dylib
+          otool -L TrollStoreJITEnabler.dylib
+
+      # ------------------------------------------------------------
+      # 4. Build insert_dylib
+      # ------------------------------------------------------------
+      - name: Build insert_dylib
+        run: |
+          set -euo pipefail
+
+          git clone \
+            https://github.com/tyilo/insert_dylib.git
+
+          cd insert_dylib
+          git checkout eb7278162af8fcc372e7f2946a2dee6a386b17d8
+
+          xcodebuild \
+            -project insert_dylib.xcodeproj \
+            -scheme insert_dylib \
+            -configuration Release \
+            build
+
+          cd ..
+
+          INSERT_DYLIB="$(
+            find ~/Library/Developer/Xcode/DerivedData \
+              -type f \
+              -path "*/Release/insert_dylib" \
+              -perm +111 \
+              | head -n 1
+          )"
+
+          if [ -z "$INSERT_DYLIB" ]; then
+            echo "insert_dylib binary not found"
+            exit 1
+          fi
+
+          cp "$INSERT_DYLIB" ./insert_dylib_bin
+          chmod +x ./insert_dylib_bin
+
+          ./insert_dylib_bin 2>&1 || true
+
+      # ------------------------------------------------------------
+      # 5. Extract IPA and preserve original entitlements
+      # ------------------------------------------------------------
+      - name: Extract IPA
+        run: |
+          set -euo pipefail
+
+          mkdir work
+          cd work
+
+          unzip -q ../ManicEMU.ipa
+
+          APP="$(find Payload -maxdepth 1 -name '*.app' -type d | head -n 1)"
+
+          if [ -z "$APP" ]; then
+            echo "App bundle not found"
+            exit 1
+          fi
+
+          EXEC_NAME="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleExecutable' \
+              "$APP/Info.plist"
+          )"
+
+          EXEC="$APP/$EXEC_NAME"
+
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "EXEC_NAME=$EXEC_NAME" >> "$GITHUB_ENV"
+
+          echo "App: $APP"
+          echo "Executable: $EXEC
