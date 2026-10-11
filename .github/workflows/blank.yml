@@ -136,14 +136,15 @@ jobs:
 
           ./insert_dylib_bin 2>&1 || true
 
-      # ------------------------------------------------------------
+# ------------------------------------------------------------
       # 5. Extract IPA and preserve original entitlements
       # ------------------------------------------------------------
       - name: Extract IPA
         run: |
           set -euo pipefail
 
-          mkdir work
+          rm -rf work
+          mkdir -p work
           cd work
 
           unzip -q ../ManicEMU.ipa
@@ -163,8 +164,188 @@ jobs:
 
           EXEC="$APP/$EXEC_NAME"
 
-          echo "APP=$APP" >> "$GITHUB_ENV"
-          echo "EXEC_NAME=$EXEC_NAME" >> "$GITHUB_ENV"
+          if [ ! -f "$EXEC" ]; then
+            echo "Executable not found: $EXEC"
+            exit 1
+          fi
+
+          printf 'APP=%s\n' "$APP" >> "$GITHUB_ENV"
+          printf 'EXEC_NAME=%s\n' "$EXEC_NAME" >> "$GITHUB_ENV"
 
           echo "App: $APP"
-          echo "Executable: $EXEC
+          echo "Executable: $EXEC"
+
+          echo "===== Original binary ====="
+          file "$EXEC"
+
+          echo "===== Extract original entitlements ====="
+          ldid -e "$EXEC" > ../entitlements.plist
+
+          if [ ! -s ../entitlements.plist ]; then
+            echo "Failed to extract entitlements"
+            exit 1
+          fi
+
+          plutil -lint ../entitlements.plist
+
+          echo "===== Original entitlements ====="
+          cat ../entitlements.plist
+
+      # ------------------------------------------------------------
+      # 6. Add TrollStore unsandbox entitlements
+      # ------------------------------------------------------------
+      - name: Patch entitlements
+        run: |
+          set -euo pipefail
+
+          PLIST="entitlements.plist"
+
+          if [ ! -f "$PLIST" ]; then
+            echo "entitlements.plist not found"
+            exit 1
+          fi
+
+          set_bool() {
+            KEY="$1"
+            VALUE="$2"
+
+            /usr/libexec/PlistBuddy \
+              -c "Delete :$KEY" \
+              "$PLIST" \
+              2>/dev/null || true
+
+            /usr/libexec/PlistBuddy \
+              -c "Add :$KEY bool $VALUE" \
+              "$PLIST"
+          }
+
+          set_bool \
+            "com.apple.private.security.container-required" \
+            false
+
+          set_bool \
+            "com.apple.private.security.no-container" \
+            true
+
+          set_bool \
+            "com.apple.private.security.no-sandbox" \
+            true
+
+          echo "===== Patched entitlements ====="
+          plutil -lint "$PLIST"
+          cat "$PLIST"
+
+      # ------------------------------------------------------------
+      # 7. Inject TrollStoreJITEnabler
+      # ------------------------------------------------------------
+      - name: Inject TrollStoreJITEnabler
+        run: |
+          set -euo pipefail
+
+          cd work
+
+          EXEC="$APP/$EXEC_NAME"
+          DYLIB="$APP/TrollStoreJITEnabler.dylib"
+
+          echo "App: $APP"
+          echo "Executable: $EXEC"
+
+          cp \
+            ../TrollStoreJITEnabler.dylib \
+            "$DYLIB"
+
+          echo "===== Injecting dylib ====="
+
+          ../insert_dylib_bin \
+            --inplace \
+            --strip-codesig \
+            --all-yes \
+            "@executable_path/TrollStoreJITEnabler.dylib" \
+            "$EXEC"
+
+          echo "===== Verify injected load command ====="
+
+          if ! otool -L "$EXEC" | grep -F "TrollStoreJITEnabler.dylib"; then
+            echo "TrollStoreJITEnabler injection failed"
+            exit 1
+          fi
+
+          file "$DYLIB"
+
+      # ------------------------------------------------------------
+      # 8. Fake sign dylib and executable
+      # ------------------------------------------------------------
+      - name: Fake sign binaries
+        run: |
+          set -euo pipefail
+
+          cd work
+
+          EXEC="$APP/$EXEC_NAME"
+          DYLIB="$APP/TrollStoreJITEnabler.dylib"
+
+          echo "===== Sign injected dylib ====="
+          ldid -S "$DYLIB"
+
+          echo "===== Sign main executable ====="
+          ldid -S../entitlements.plist "$EXEC"
+
+          echo "===== Verify final entitlements ====="
+          ldid -e "$EXEC"
+
+          echo "===== Verify dylib ====="
+          otool -L "$EXEC" | grep -F "TrollStoreJITEnabler.dylib"
+
+      # ------------------------------------------------------------
+      # 9. Repackage IPA
+      # ------------------------------------------------------------
+      - name: Package TrollStore IPA
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          cd work
+
+          OUTPUT="../ManicEMU.${VERSION}.TrollStoreJIT.ipa"
+
+          echo "===== Creating IPA ====="
+
+          zip -qry "$OUTPUT" Payload
+
+          cd ..
+
+          if [ ! -f "ManicEMU.${VERSION}.TrollStoreJIT.ipa" ]; then
+            echo "IPA creation failed"
+            exit 1
+          fi
+
+          echo "===== Result ====="
+
+          ls -lh "ManicEMU.${VERSION}.TrollStoreJIT.ipa"
+
+          echo "===== Verify IPA ====="
+
+          unzip -t "ManicEMU.${VERSION}.TrollStoreJIT.ipa" >/dev/null
+
+          echo "Final IPA verification passed."
+
+      # ------------------------------------------------------------
+
+      # 10. Upload result
+
+      # ------------------------------------------------------------
+
+      - name: Upload TrollStore IPA
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: ManicEMU-${{ inputs.version }}-TrollStoreJIT
+
+          path: ManicEMU.${{ inputs.version }}.TrollStoreJIT.ipa
+
+          if-no-files-found: error
+
+          retention-days: 30
